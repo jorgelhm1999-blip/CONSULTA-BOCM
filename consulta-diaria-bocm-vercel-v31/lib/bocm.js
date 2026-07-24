@@ -421,10 +421,26 @@ async function fetchXmlRecordDetailed(cve, { timeoutMs = 5200, attempts = 1 } = 
   const url = xmlUrlFromCve(cve);
   const response = await fetchResource(url, { timeoutMs, attempts });
   if (response.kind !== 'ok') return { status: response.kind, record: null };
-  const record = parseXmlRecord(response.text, cve);
-  return record
-    ? { status: 'ok', record }
-    : { status: 'transient', record: null };
+
+  const raw = String(response.text || '').trim();
+  const record = parseXmlRecord(raw, cve);
+  if (record) return { status: 'ok', record };
+
+  // El servidor del BOCM puede devolver una pagina HTML con HTTP 200 cuando
+  // un CVE/XML numerado no existe. Eso no es un fallo temporal: confirma que
+  // hemos superado el final del boletin. Solo se conserva como transitorio
+  // cuando la respuesta contiene señales claras de indisponibilidad tecnica.
+  const responseText = normalize(raw.slice(0, 4000));
+  const temporaryFailure = [
+    'service unavailable', 'temporarily unavailable', 'gateway timeout',
+    'bad gateway', 'request timeout', 'access denied', 'too many requests',
+    'cloudflare', 'captcha', 'error interno', 'internal server error'
+  ].some(term => responseText.includes(term));
+
+  if (temporaryFailure || !raw) {
+    return { status: 'transient', record: null };
+  }
+  return { status: 'not_found', record: null };
 }
 
 function cveNumber(cve = '') {
@@ -640,148 +656,13 @@ export async function searchHistoricalBocm() {
   return { results: [], total: 0, disabled: true };
 }
 
-
-// Enumera los CVE oficiales del día mediante los propios XML.
-// No modifica classifyRecord() ni ninguna regla temática.
-async function findLastCveNumber(compact) {
-  const cache = new Map();
-
-  async function checkedProbe(number) {
-    if (cache.has(number)) return cache.get(number);
-
-    let result = await fetchNumber(compact, number, { timeoutMs: 4200, attempts: 1 });
-    if (result.status === 'transient') {
-      await new Promise(resolve => setTimeout(resolve, 180));
-      result = await fetchNumber(compact, number, { timeoutMs: 6500, attempts: 1 });
-    }
-    cache.set(number, result);
-    return result;
-  }
-
-  const first = await checkedProbe(1);
-  if (first.status === 'not_found') {
-    return { found: false, definitelyMissing: true, firstRecord: null, lastNumber: 0, incomplete: false };
-  }
-  if (first.status !== 'ok' || !first.record) {
-    return { found: false, definitelyMissing: false, firstRecord: null, lastNumber: 0, incomplete: true };
-  }
-
-  // La numeración ordinaria de cada boletín es correlativa desde 1.
-  // Se busca primero un límite superior con saltos crecientes y luego se
-  // determina el último XML existente mediante búsqueda binaria.
-  let lower = 1;
-  let upper = 16;
-  let incomplete = false;
-
-  while (upper <= 512) {
-    const probe = await checkedProbe(upper);
-    if (probe.status === 'ok') {
-      lower = upper;
-      upper *= 2;
-      continue;
-    }
-    if (probe.status === 'not_found') break;
-
-    // Un fallo temporal no equivale a final del boletín. Se intenta un punto
-    // algo menor para poder seguir acotando sin disparar cientos de consultas.
-    incomplete = true;
-    const fallback = Math.max(lower + 1, upper - Math.max(4, Math.floor((upper - lower) / 3)));
-    const fallbackProbe = await checkedProbe(fallback);
-    if (fallbackProbe.status === 'ok') {
-      lower = fallback;
-      upper += Math.max(8, Math.floor((upper - lower) / 2));
-      continue;
-    }
-    if (fallbackProbe.status === 'not_found') {
-      upper = fallback;
-      break;
-    }
-
-    return {
-      found: true,
-      definitelyMissing: false,
-      firstRecord: first.record,
-      lastNumber: lower,
-      incomplete: true
-    };
-  }
-
-  upper = Math.min(upper, 513);
-  while (lower + 1 < upper) {
-    const middle = Math.floor((lower + upper) / 2);
-    const probe = await checkedProbe(middle);
-    if (probe.status === 'ok') {
-      lower = middle;
-    } else if (probe.status === 'not_found') {
-      upper = middle;
-    } else {
-      incomplete = true;
-      // Un segundo punto vecino ayuda a no interpretar una caída temporal
-      // como ausencia. Si tampoco responde, se conserva el límite seguro.
-      const neighbor = middle > lower + 1 ? middle - 1 : middle + 1;
-      const neighborProbe = await checkedProbe(neighbor);
-      if (neighborProbe.status === 'ok') lower = Math.max(lower, neighbor);
-      else if (neighborProbe.status === 'not_found') upper = Math.min(upper, neighbor);
-      else break;
-    }
-  }
-
-  return {
-    found: true,
-    definitelyMissing: false,
-    firstRecord: first.record,
-    lastNumber: lower,
-    incomplete
-  };
-}
-
-export async function discoverBocmManifest(date) {
-  const compact = String(date || '').replaceAll('-', '');
-  const boundary = await findLastCveNumber(compact);
-
-  if (!boundary.found) {
-    return {
-      found: false,
-      definitelyMissing: boundary.definitelyMissing,
-      bulletinNumber: 0,
-      bulletinUrl: '',
-      cves: [],
-      incomplete: boundary.incomplete
-    };
-  }
-
-  const bulletinNumber = Number(boundary.firstRecord?.bulletinNumber || 0);
-  const cves = Array.from(
-    { length: boundary.lastNumber },
-    (_, index) => `BOCM-${compact}-${index + 1}`
-  );
-
-  return {
-    found: true,
-    definitelyMissing: false,
-    bulletinNumber,
-    bulletinUrl: bulletinNumber
-      ? `${BASE}/boletin/bocm-${compact}-${bulletinNumber}`
-      : `${BASE}/boletin/bocm-${compact}`,
-    cves,
-    lastNumber: boundary.lastNumber,
-    sectionPages: 0,
-    incomplete: boundary.incomplete
-  };
-}
-
 // Consulta fragmentada para Vercel: cada invocacion procesa un lote pequeno
 // de XML. El clasificador y las reglas anteriores no se modifican.
-export async function searchBocmBatch(date, municipalityText = '', startValue = 1, sizeValue = 12, explicitNumbers = []) {
+export async function searchBocmBatch(date, municipalityText = '', startValue = 1, sizeValue = 12) {
   const compact = String(date || '').replaceAll('-', '');
   const start = Math.max(1, Math.min(400, Number(startValue) || 1));
   const size = Math.max(1, Math.min(15, Number(sizeValue) || 12));
-  const parsedNumbers = Array.isArray(explicitNumbers)
-    ? explicitNumbers.map(Number).filter(number => Number.isInteger(number) && number > 0 && number <= 500)
-    : [];
-  const numbers = parsedNumbers.length
-    ? [...new Set(parsedNumbers)].slice(0, 15)
-    : Array.from({ length: size }, (_, index) => start + index);
+  const numbers = Array.from({ length: size }, (_, index) => start + index);
 
   const fetched = await mapConcurrent(numbers, Math.min(12, size), number =>
     fetchNumber(compact, number, { timeoutMs: 3200, attempts: 1 })
@@ -838,8 +719,8 @@ export async function searchBocmBatch(date, municipalityText = '', startValue = 
   return {
     found: existingCount > 0,
     start,
-    size: numbers.length,
-    nextStart: start + numbers.length,
+    size,
+    nextStart: start + size,
     existingCount,
     missingCount,
     transientCount,
