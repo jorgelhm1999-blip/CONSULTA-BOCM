@@ -1,25 +1,36 @@
-import { searchBocmBatch } from '../lib/bocm.js';
+import { getBocmManifest, searchBocmCveBatch } from '../lib/bocm.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Método no permitido.' });
   }
 
+  const mode = String(req.query.mode || 'manifest');
   const date = String(req.query.date || '');
   const municipality = String(req.query.municipality || '');
-  const start = Number(req.query.start || 1);
-  const size = Number(req.query.size || 12);
 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     return res.status(400).json({ error: 'Fecha no válida.' });
   }
 
   try {
-    const data = await searchBocmBatch(date, municipality, start, size);
+    let data;
+    if (mode === 'manifest') {
+      data = await getBocmManifest(date);
+    } else if (mode === 'batch') {
+      const cves = String(req.query.cves || '').split(',').filter(Boolean);
+      if (!cves.length || cves.length > 15) {
+        return res.status(400).json({ error: 'Lote de CVE no válido.' });
+      }
+      data = await searchBocmCveBatch(date, municipality, cves);
+    } else {
+      return res.status(400).json({ error: 'Modo de consulta no válido.' });
+    }
+
     res.setHeader('Cache-Control', 's-maxage=86400, stale-while-revalidate=604800');
     return res.status(200).json(data);
   } catch (error) {
     console.error(error);
-    return res.status(502).json({ error: 'No se ha podido consultar este lote del BOCM.' });
+    return res.status(502).json({ error: error?.message || 'No se ha podido consultar el BOCM.' });
   }
 }
