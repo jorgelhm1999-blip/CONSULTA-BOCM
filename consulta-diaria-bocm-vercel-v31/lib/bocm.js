@@ -640,13 +640,70 @@ export async function searchHistoricalBocm() {
   return { results: [], total: 0, disabled: true };
 }
 
+
+// Devuelve la lista exacta de CVE publicada en el sumario oficial del día.
+// Esta función solo enumera anuncios; no modifica el clasificador XML.
+export async function discoverBocmManifest(date) {
+  const compact = String(date || '').replaceAll('-', '');
+  const first = await probeNumber(compact, 1);
+
+  if (first.status === 'not_found') {
+    return {
+      found: false,
+      definitelyMissing: true,
+      bulletinNumber: 0,
+      bulletinUrl: '',
+      cves: [],
+      incomplete: false
+    };
+  }
+
+  if (first.status !== 'ok' || !first.record) {
+    return {
+      found: false,
+      definitelyMissing: false,
+      bulletinNumber: 0,
+      bulletinUrl: '',
+      cves: [],
+      incomplete: true
+    };
+  }
+
+  const bulletinNumber = Number(first.record.bulletinNumber || 0);
+  const summary = await discoverCvesFromOfficialSummary(date, first.record);
+  const cves = [...new Set(summary.cves || [])]
+    .filter(cve => new RegExp(`^BOCM-${compact}-\\d+$`, 'i').test(cve))
+    .sort((a, b) => cveNumber(a) - cveNumber(b));
+
+  // El anuncio 1 confirma el boletín y se incorpora si el sumario lo omite.
+  const firstCve = `BOCM-${compact}-1`;
+  if (!cves.includes(firstCve)) cves.unshift(firstCve);
+
+  return {
+    found: true,
+    definitelyMissing: false,
+    bulletinNumber,
+    bulletinUrl: bulletinNumber
+      ? `${BASE}/boletin/bocm-${compact}-${bulletinNumber}`
+      : `${BASE}/boletin/bocm-${compact}`,
+    cves,
+    sectionPages: summary.sectionPages || 0,
+    incomplete: cves.length <= 1
+  };
+}
+
 // Consulta fragmentada para Vercel: cada invocacion procesa un lote pequeno
 // de XML. El clasificador y las reglas anteriores no se modifican.
-export async function searchBocmBatch(date, municipalityText = '', startValue = 1, sizeValue = 12) {
+export async function searchBocmBatch(date, municipalityText = '', startValue = 1, sizeValue = 12, explicitNumbers = []) {
   const compact = String(date || '').replaceAll('-', '');
   const start = Math.max(1, Math.min(400, Number(startValue) || 1));
   const size = Math.max(1, Math.min(15, Number(sizeValue) || 12));
-  const numbers = Array.from({ length: size }, (_, index) => start + index);
+  const parsedNumbers = Array.isArray(explicitNumbers)
+    ? explicitNumbers.map(Number).filter(number => Number.isInteger(number) && number > 0 && number <= 500)
+    : [];
+  const numbers = parsedNumbers.length
+    ? [...new Set(parsedNumbers)].slice(0, 15)
+    : Array.from({ length: size }, (_, index) => start + index);
 
   const fetched = await mapConcurrent(numbers, Math.min(12, size), number =>
     fetchNumber(compact, number, { timeoutMs: 3200, attempts: 1 })
@@ -703,8 +760,8 @@ export async function searchBocmBatch(date, municipalityText = '', startValue = 
   return {
     found: existingCount > 0,
     start,
-    size,
-    nextStart: start + size,
+    size: numbers.length,
+    nextStart: start + numbers.length,
     existingCount,
     missingCount,
     transientCount,
