@@ -8,7 +8,8 @@ const searchButton = $('#search');
 const status = $('#status');
 const results = $('#results');
 
-const BATCH_SIZE = 12;
+const BATCH_SIZE = 4;
+const MAX_RETRY_ROUNDS = 3;
 
 const today = new Date();
 dateInput.value = [today.getFullYear(), String(today.getMonth() + 1).padStart(2, '0'), String(today.getDate()).padStart(2, '0')].join('-');
@@ -88,12 +89,33 @@ async function runSearch() {
 
       const data = await requestJson(params);
       scanned += data.existingCount || 0;
-      if ((data.transientCount || 0) > 0) incomplete = true;
       for (const item of data.results || []) resultMap.set(item.cve, item);
+      if (Array.isArray(data.failedCves) && data.failedCves.length) {
+        manifest.failedCves = [...(manifest.failedCves || []), ...data.failedCves];
+      }
 
       const partial = [...resultMap.values()].sort((a, b) => cveNumber(a.cve) - cveNumber(b.cve));
       results.innerHTML = partial.length ? partial.map(renderCard).join('') : '';
     }
+
+    let pending = [...new Set(manifest.failedCves || [])];
+    for (let round = 1; pending.length && round <= MAX_RETRY_ROUNDS; round += 1) {
+      const nextPending = [];
+      for (let offset = 0; offset < pending.length; offset += BATCH_SIZE) {
+        const batch = pending.slice(offset, offset + BATCH_SIZE);
+        status.innerHTML = `<span class="spinner"></span>Reintentando ${batch.length} anuncio(s) pendientes · ronda ${round}/${MAX_RETRY_ROUNDS}…`;
+        const params = new URLSearchParams({ mode: 'batch', date: dateInput.value, cves: batch.join(',') });
+        if (municipalityInput.value.trim()) params.set('municipality', municipalityInput.value.trim());
+        const data = await requestJson(params);
+        scanned += data.existingCount || 0;
+        for (const item of data.results || []) resultMap.set(item.cve, item);
+        if (Array.isArray(data.failedCves)) nextPending.push(...data.failedCves);
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      pending = [...new Set(nextPending)];
+    }
+    incomplete = pending.length > 0;
+    scanned = allCves.length - pending.length;
 
     const finalResults = [...resultMap.values()].sort((a, b) => cveNumber(a.cve) - cveNumber(b.cve));
     const warning = incomplete ? ' · Consulta parcial: algún XML individual no respondió' : '';
