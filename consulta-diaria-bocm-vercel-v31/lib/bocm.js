@@ -725,26 +725,26 @@ function dailySummaryXmlUrl(date, bulletinNumber) {
 
 export async function getBocmManifest(date) {
   const compact = String(date || '').replaceAll('-', '');
-  const firstCve = `BOCM-${compact}-1`;
-  const first = await fetchXmlRecordDetailed(firstCve, { timeoutMs: 7000, attempts: 2 });
 
-  if (first.status === 'not_found') {
+  // El número del boletín se obtiene desde su página oficial, no desde el
+  // primer XML individual. Así un fallo puntual del anuncio -1 no invalida
+  // todo el día.
+  const bulletin = await locateBulletin(date);
+  if (!bulletin) {
     return { found: false, cves: [], bulletinNumber: 0, bulletinUrl: '' };
   }
-  if (first.status !== 'ok' || !first.record) {
-    throw new Error('No se pudo confirmar el primer anuncio del boletín.');
-  }
 
-  const bulletinNumber = Number(first.record.bulletinNumber || 0);
-  if (!bulletinNumber) throw new Error('El XML no indica el número del boletín.');
-
+  const bulletinNumber = Number(bulletin.number || 0);
   const summaryUrl = dailySummaryXmlUrl(date, bulletinNumber);
-  const summary = await fetchResource(summaryUrl, { timeoutMs: 10000, attempts: 2 });
+  const summary = await fetchResource(summaryUrl, { timeoutMs: 12000, attempts: 3 });
   if (summary.kind !== 'ok' || !summary.text) {
     throw new Error('No se pudo obtener el sumario XML completo del boletín.');
   }
 
-  const cves = extractCves(summary.text, compact);
+  // Se eliminan identificadores repetidos y el identificador genérico del
+  // boletín, conservando solo CVE individuales terminados en -número.
+  const cves = extractCves(summary.text, compact)
+    .filter(cve => /^BOCM-\d{8}-\d+$/.test(cve));
   if (!cves.length) {
     throw new Error('El sumario XML no contiene la relación de anuncios del día.');
   }
@@ -752,7 +752,7 @@ export async function getBocmManifest(date) {
   return {
     found: true,
     bulletinNumber,
-    bulletinUrl: `${BASE}/boletin/bocm-${compact}-${bulletinNumber}`,
+    bulletinUrl: bulletin.url || `${BASE}/boletin/bocm-${compact}-${bulletinNumber}`,
     summaryXmlUrl: summaryUrl,
     cves
   };
@@ -765,11 +765,8 @@ export async function searchBocmCveBatch(date, municipalityText = '', cveValues 
     .filter(value => new RegExp(`^BOCM-${compact}-\\d+$`).test(value))
   )].slice(0, 15);
 
-  const fetched = await mapConcurrent(cves, Math.min(10, cves.length), async cve => {
-    let item = await fetchXmlRecordDetailed(cve, { timeoutMs: 4500, attempts: 1 });
-    if (item.status === 'transient') {
-      item = await fetchXmlRecordDetailed(cve, { timeoutMs: 7000, attempts: 1 });
-    }
+  const fetched = await mapConcurrent(cves, Math.min(2, cves.length), async cve => {
+    const item = await fetchXmlRecordDetailed(cve, { timeoutMs: 9000, attempts: 2 });
     return { cve, ...item };
   });
 
@@ -815,5 +812,8 @@ export async function searchBocmCveBatch(date, municipalityText = '', cveValues 
   }
 
   results.sort((a, b) => cveNumber(a.cve) - cveNumber(b.cve));
-  return { existingCount, missingCount, transientCount, results };
+  const failedCves = fetched
+    .filter(item => item.status !== 'ok' || !item.record)
+    .map(item => item.cve);
+  return { existingCount, missingCount, transientCount, failedCves, results };
 }
