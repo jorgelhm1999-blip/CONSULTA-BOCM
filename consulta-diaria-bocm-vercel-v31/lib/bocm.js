@@ -641,43 +641,120 @@ export async function searchHistoricalBocm() {
 }
 
 
-// Devuelve la lista exacta de CVE publicada en el sumario oficial del día.
-// Esta función solo enumera anuncios; no modifica el clasificador XML.
-export async function discoverBocmManifest(date) {
-  const compact = String(date || '').replaceAll('-', '');
-  const first = await probeNumber(compact, 1);
+// Enumera los CVE oficiales del día mediante los propios XML.
+// No modifica classifyRecord() ni ninguna regla temática.
+async function findLastCveNumber(compact) {
+  const cache = new Map();
 
-  if (first.status === 'not_found') {
-    return {
-      found: false,
-      definitelyMissing: true,
-      bulletinNumber: 0,
-      bulletinUrl: '',
-      cves: [],
-      incomplete: false
-    };
+  async function checkedProbe(number) {
+    if (cache.has(number)) return cache.get(number);
+
+    let result = await fetchNumber(compact, number, { timeoutMs: 4200, attempts: 1 });
+    if (result.status === 'transient') {
+      await new Promise(resolve => setTimeout(resolve, 180));
+      result = await fetchNumber(compact, number, { timeoutMs: 6500, attempts: 1 });
+    }
+    cache.set(number, result);
+    return result;
   }
 
+  const first = await checkedProbe(1);
+  if (first.status === 'not_found') {
+    return { found: false, definitelyMissing: true, firstRecord: null, lastNumber: 0, incomplete: false };
+  }
   if (first.status !== 'ok' || !first.record) {
+    return { found: false, definitelyMissing: false, firstRecord: null, lastNumber: 0, incomplete: true };
+  }
+
+  // La numeración ordinaria de cada boletín es correlativa desde 1.
+  // Se busca primero un límite superior con saltos crecientes y luego se
+  // determina el último XML existente mediante búsqueda binaria.
+  let lower = 1;
+  let upper = 16;
+  let incomplete = false;
+
+  while (upper <= 512) {
+    const probe = await checkedProbe(upper);
+    if (probe.status === 'ok') {
+      lower = upper;
+      upper *= 2;
+      continue;
+    }
+    if (probe.status === 'not_found') break;
+
+    // Un fallo temporal no equivale a final del boletín. Se intenta un punto
+    // algo menor para poder seguir acotando sin disparar cientos de consultas.
+    incomplete = true;
+    const fallback = Math.max(lower + 1, upper - Math.max(4, Math.floor((upper - lower) / 3)));
+    const fallbackProbe = await checkedProbe(fallback);
+    if (fallbackProbe.status === 'ok') {
+      lower = fallback;
+      upper += Math.max(8, Math.floor((upper - lower) / 2));
+      continue;
+    }
+    if (fallbackProbe.status === 'not_found') {
+      upper = fallback;
+      break;
+    }
+
     return {
-      found: false,
+      found: true,
       definitelyMissing: false,
-      bulletinNumber: 0,
-      bulletinUrl: '',
-      cves: [],
+      firstRecord: first.record,
+      lastNumber: lower,
       incomplete: true
     };
   }
 
-  const bulletinNumber = Number(first.record.bulletinNumber || 0);
-  const summary = await discoverCvesFromOfficialSummary(date, first.record);
-  const cves = [...new Set(summary.cves || [])]
-    .filter(cve => new RegExp(`^BOCM-${compact}-\\d+$`, 'i').test(cve))
-    .sort((a, b) => cveNumber(a) - cveNumber(b));
+  upper = Math.min(upper, 513);
+  while (lower + 1 < upper) {
+    const middle = Math.floor((lower + upper) / 2);
+    const probe = await checkedProbe(middle);
+    if (probe.status === 'ok') {
+      lower = middle;
+    } else if (probe.status === 'not_found') {
+      upper = middle;
+    } else {
+      incomplete = true;
+      // Un segundo punto vecino ayuda a no interpretar una caída temporal
+      // como ausencia. Si tampoco responde, se conserva el límite seguro.
+      const neighbor = middle > lower + 1 ? middle - 1 : middle + 1;
+      const neighborProbe = await checkedProbe(neighbor);
+      if (neighborProbe.status === 'ok') lower = Math.max(lower, neighbor);
+      else if (neighborProbe.status === 'not_found') upper = Math.min(upper, neighbor);
+      else break;
+    }
+  }
 
-  // El anuncio 1 confirma el boletín y se incorpora si el sumario lo omite.
-  const firstCve = `BOCM-${compact}-1`;
-  if (!cves.includes(firstCve)) cves.unshift(firstCve);
+  return {
+    found: true,
+    definitelyMissing: false,
+    firstRecord: first.record,
+    lastNumber: lower,
+    incomplete
+  };
+}
+
+export async function discoverBocmManifest(date) {
+  const compact = String(date || '').replaceAll('-', '');
+  const boundary = await findLastCveNumber(compact);
+
+  if (!boundary.found) {
+    return {
+      found: false,
+      definitelyMissing: boundary.definitelyMissing,
+      bulletinNumber: 0,
+      bulletinUrl: '',
+      cves: [],
+      incomplete: boundary.incomplete
+    };
+  }
+
+  const bulletinNumber = Number(boundary.firstRecord?.bulletinNumber || 0);
+  const cves = Array.from(
+    { length: boundary.lastNumber },
+    (_, index) => `BOCM-${compact}-${index + 1}`
+  );
 
   return {
     found: true,
@@ -687,8 +764,9 @@ export async function discoverBocmManifest(date) {
       ? `${BASE}/boletin/bocm-${compact}-${bulletinNumber}`
       : `${BASE}/boletin/bocm-${compact}`,
     cves,
-    sectionPages: summary.sectionPages || 0,
-    incomplete: cves.length <= 1
+    lastNumber: boundary.lastNumber,
+    sectionPages: 0,
+    incomplete: boundary.incomplete
   };
 }
 
