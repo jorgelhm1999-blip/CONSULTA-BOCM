@@ -421,26 +421,10 @@ async function fetchXmlRecordDetailed(cve, { timeoutMs = 5200, attempts = 1 } = 
   const url = xmlUrlFromCve(cve);
   const response = await fetchResource(url, { timeoutMs, attempts });
   if (response.kind !== 'ok') return { status: response.kind, record: null };
-
-  const raw = String(response.text || '').trim();
-  const record = parseXmlRecord(raw, cve);
-  if (record) return { status: 'ok', record };
-
-  // El servidor del BOCM puede devolver una pagina HTML con HTTP 200 cuando
-  // un CVE/XML numerado no existe. Eso no es un fallo temporal: confirma que
-  // hemos superado el final del boletin. Solo se conserva como transitorio
-  // cuando la respuesta contiene señales claras de indisponibilidad tecnica.
-  const responseText = normalize(raw.slice(0, 4000));
-  const temporaryFailure = [
-    'service unavailable', 'temporarily unavailable', 'gateway timeout',
-    'bad gateway', 'request timeout', 'access denied', 'too many requests',
-    'cloudflare', 'captcha', 'error interno', 'internal server error'
-  ].some(term => responseText.includes(term));
-
-  if (temporaryFailure || !raw) {
-    return { status: 'transient', record: null };
-  }
-  return { status: 'not_found', record: null };
+  const record = parseXmlRecord(response.text, cve);
+  return record
+    ? { status: 'ok', record }
+    : { status: 'transient', record: null };
 }
 
 function cveNumber(cve = '') {
@@ -729,3 +713,107 @@ export async function searchBocmBatch(date, municipalityText = '', startValue = 
   };
 }
 
+
+
+// Índice exacto del boletín: utiliza el XML oficial del sumario completo.
+// No estima el último CVE ni recorre números inexistentes.
+function dailySummaryXmlUrl(date, bulletinNumber) {
+  const compact = String(date || '').replaceAll('-', '');
+  const [year, month, day] = String(date || '').split('-');
+  return `${BASE}/boletin/CM_Boletin_BOCM/${year}/${month}/${day}/BOCM-${compact}${bulletinNumber}.xml`;
+}
+
+export async function getBocmManifest(date) {
+  const compact = String(date || '').replaceAll('-', '');
+  const firstCve = `BOCM-${compact}-1`;
+  const first = await fetchXmlRecordDetailed(firstCve, { timeoutMs: 7000, attempts: 2 });
+
+  if (first.status === 'not_found') {
+    return { found: false, cves: [], bulletinNumber: 0, bulletinUrl: '' };
+  }
+  if (first.status !== 'ok' || !first.record) {
+    throw new Error('No se pudo confirmar el primer anuncio del boletín.');
+  }
+
+  const bulletinNumber = Number(first.record.bulletinNumber || 0);
+  if (!bulletinNumber) throw new Error('El XML no indica el número del boletín.');
+
+  const summaryUrl = dailySummaryXmlUrl(date, bulletinNumber);
+  const summary = await fetchResource(summaryUrl, { timeoutMs: 10000, attempts: 2 });
+  if (summary.kind !== 'ok' || !summary.text) {
+    throw new Error('No se pudo obtener el sumario XML completo del boletín.');
+  }
+
+  const cves = extractCves(summary.text, compact);
+  if (!cves.length) {
+    throw new Error('El sumario XML no contiene la relación de anuncios del día.');
+  }
+
+  return {
+    found: true,
+    bulletinNumber,
+    bulletinUrl: `${BASE}/boletin/bocm-${compact}-${bulletinNumber}`,
+    summaryXmlUrl: summaryUrl,
+    cves
+  };
+}
+
+export async function searchBocmCveBatch(date, municipalityText = '', cveValues = []) {
+  const compact = String(date || '').replaceAll('-', '');
+  const cves = [...new Set((Array.isArray(cveValues) ? cveValues : [])
+    .map(value => String(value || '').trim().toUpperCase())
+    .filter(value => new RegExp(`^BOCM-${compact}-\\d+$`).test(value))
+  )].slice(0, 15);
+
+  const fetched = await mapConcurrent(cves, Math.min(10, cves.length), async cve => {
+    let item = await fetchXmlRecordDetailed(cve, { timeoutMs: 4500, attempts: 1 });
+    if (item.status === 'transient') {
+      item = await fetchXmlRecordDetailed(cve, { timeoutMs: 7000, attempts: 1 });
+    }
+    return { cve, ...item };
+  });
+
+  const municipalityFilter = normalize(municipalityText);
+  const results = [];
+  let existingCount = 0;
+  let missingCount = 0;
+  let transientCount = 0;
+
+  for (const item of fetched) {
+    if (item.status === 'not_found') {
+      missingCount += 1;
+      continue;
+    }
+    if (item.status !== 'ok' || !item.record) {
+      transientCount += 1;
+      continue;
+    }
+
+    existingCount += 1;
+    const record = item.record;
+    const relevance = classifyRecord(record);
+    if (!relevance) continue;
+
+    const municipality = municipalityFromRecord(record);
+    if (municipalityFilter) {
+      const haystack = normalize(`${municipality} ${record.title} ${record.body}`);
+      if (!haystack.includes(municipalityFilter)) continue;
+    }
+
+    results.push({
+      cve: record.cve,
+      title: record.title || record.cve,
+      municipality,
+      summary: buildSummary(record),
+      url: record.htmlUrl,
+      score: relevance.score,
+      reason: relevance.reason,
+      matches: relevance.matches,
+      section: record.section,
+      department: record.department || record.organization
+    });
+  }
+
+  results.sort((a, b) => cveNumber(a.cve) - cveNumber(b.cve));
+  return { existingCount, missingCount, transientCount, results };
+}
