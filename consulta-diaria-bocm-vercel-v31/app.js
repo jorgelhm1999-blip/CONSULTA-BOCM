@@ -9,7 +9,6 @@ const status = $('#status');
 const results = $('#results');
 
 const BATCH_SIZE = 12;
-const MAX_ANNOUNCEMENTS = 360;
 
 const today = new Date();
 dateInput.value = [today.getFullYear(), String(today.getMonth() + 1).padStart(2, '0'), String(today.getDate()).padStart(2, '0')].join('-');
@@ -36,7 +35,7 @@ function setLoading(text) {
   status.innerHTML = `<span class="spinner"></span>${text}`;
 }
 
-async function requestBatch(params, retry = false) {
+async function requestJson(params, retry = false) {
   const response = await fetch(`/api/search?${params}`);
   const raw = await response.text();
   let data;
@@ -50,78 +49,81 @@ async function requestBatch(params, retry = false) {
   }
   if (!response.ok) throw new Error(data.error || `Error de consulta (${response.status})`);
 
-  // Un lote con fallos temporales se repite una sola vez. Cada invocación
-  // sigue siendo pequeña y no acumula trabajo hasta provocar un 504.
   if (data.transientCount > 0 && !retry) {
     await new Promise(resolve => setTimeout(resolve, 350));
-    return requestBatch(params, true);
+    return requestJson(params, true);
   }
   return data;
+}
+
+function numberFromCve(cve = '') {
+  return Number(String(cve).split('-').pop()) || 0;
 }
 
 async function runSearch() {
   if (!dateInput.value) return;
   searchButton.disabled = true;
-  setLoading('Consultando XML del BOCM por lotes…');
+  setLoading('Localizando el índice XML del BOCM…');
 
   const resultMap = new Map();
-  let start = 1;
   let scanned = 0;
-  let bulletinNumber = 0;
-  let consecutiveEmpty = 0;
-  let foundAny = false;
   let incomplete = false;
 
   try {
-    while (start <= MAX_ANNOUNCEMENTS) {
-      const params = new URLSearchParams({
-        date: dateInput.value,
-        start: String(start),
-        size: String(BATCH_SIZE)
-      });
-      if (municipalityInput.value.trim()) params.set('municipality', municipalityInput.value.trim());
+    const manifestParams = new URLSearchParams({
+      date: dateInput.value,
+      mode: 'manifest'
+    });
+    const manifest = await requestJson(manifestParams);
 
-      status.innerHTML = `<span class="spinner"></span>Revisando anuncios ${start}-${start + BATCH_SIZE - 1}…`;
-      const data = await requestBatch(params);
-
-      if (data.bulletinNumber) bulletinNumber = data.bulletinNumber;
-      if (data.transientCount > 0) incomplete = true;
-      scanned += data.existingCount || 0;
-
-      for (const item of data.results || []) resultMap.set(item.cve, item);
-
-      if ((data.existingCount || 0) > 0) {
-        foundAny = true;
-        consecutiveEmpty = 0;
-      } else if ((data.missingCount || 0) === BATCH_SIZE && (data.transientCount || 0) === 0) {
-        consecutiveEmpty += 1;
-      } else {
-        consecutiveEmpty = 0;
-      }
-
-      const partial = [...resultMap.values()].sort((a, b) => b.score - a.score || a.cve.localeCompare(b.cve, undefined, { numeric: true }));
-      results.innerHTML = partial.length ? partial.map(renderCard).join('') : '';
-
-      // Dos lotes consecutivos totalmente inexistentes confirman el final.
-      // Antes de encontrar el anuncio 1, dos lotes vacíos significan día sin BOCM.
-      if (consecutiveEmpty >= 2) break;
-      start += BATCH_SIZE;
-    }
-
-    if (!foundAny) {
-      status.textContent = 'No se ha localizado un boletín para esa fecha. Puede ser festivo o día sin publicación.';
+    if (!manifest.found) {
+      status.textContent = manifest.definitelyMissing
+        ? 'No se ha localizado un boletín para esa fecha. Puede ser festivo o día sin publicación.'
+        : 'No se ha podido obtener el índice completo del boletín.';
       results.innerHTML = '<div class="empty">No hay BOCM localizado para la fecha seleccionada.</div>';
       return;
     }
 
-    const finalResults = [...resultMap.values()].sort((a, b) => b.score - a.score || a.cve.localeCompare(b.cve, undefined, { numeric: true }));
-    const compact = dateInput.value.replaceAll('-', '');
-    const bulletinUrl = bulletinNumber
-      ? `https://www.bocm.es/boletin/bocm-${compact}-${bulletinNumber}`
-      : `https://www.bocm.es/boletin/bocm-${compact}`;
+    const cves = [...new Set(manifest.cves || [])]
+      .sort((a, b) => numberFromCve(a) - numberFromCve(b));
+
+    if (!cves.length) {
+      throw new Error('El boletín existe, pero no se han podido enumerar sus anuncios.');
+    }
+
+    incomplete = Boolean(manifest.incomplete);
+
+    for (let offset = 0; offset < cves.length; offset += BATCH_SIZE) {
+      const batch = cves.slice(offset, offset + BATCH_SIZE);
+      const firstNumber = numberFromCve(batch[0]);
+      const lastNumber = numberFromCve(batch[batch.length - 1]);
+      status.innerHTML = `<span class="spinner"></span>Revisando anuncios ${firstNumber}-${lastNumber} de ${cves.length}…`;
+
+      const params = new URLSearchParams({
+        date: dateInput.value,
+        numbers: batch.map(numberFromCve).join(',')
+      });
+      if (municipalityInput.value.trim()) params.set('municipality', municipalityInput.value.trim());
+
+      const data = await requestJson(params);
+      if (data.transientCount > 0) incomplete = true;
+      scanned += data.existingCount || 0;
+      for (const item of data.results || []) resultMap.set(item.cve, item);
+
+      const partial = [...resultMap.values()].sort((a, b) =>
+        b.score - a.score || a.cve.localeCompare(b.cve, undefined, { numeric: true })
+      );
+      results.innerHTML = partial.length ? partial.map(renderCard).join('') : '';
+    }
+
+    const finalResults = [...resultMap.values()].sort((a, b) =>
+      b.score - a.score || a.cve.localeCompare(b.cve, undefined, { numeric: true })
+    );
     const warning = incomplete ? ' · Consulta parcial: algún XML no respondió' : '';
-    status.innerHTML = `<strong>BOCM nº ${bulletinNumber || '?'}</strong> · ${finalResults.length} resultado(s) de interés entre ${scanned} anuncios revisados${warning}. <a href="${bulletinUrl}" target="_blank" rel="noopener">Ver sumario oficial</a>`;
-    results.innerHTML = finalResults.length ? finalResults.map(renderCard).join('') : '<div class="empty">No se han detectado publicaciones que cumplan los criterios configurados.</div>';
+    status.innerHTML = `<strong>BOCM nº ${manifest.bulletinNumber || '?'}</strong> · ${finalResults.length} resultado(s) de interés entre ${scanned} anuncios revisados${warning}. <a href="${manifest.bulletinUrl}" target="_blank" rel="noopener">Ver sumario oficial</a>`;
+    results.innerHTML = finalResults.length
+      ? finalResults.map(renderCard).join('')
+      : '<div class="empty">No se han detectado publicaciones que cumplan los criterios configurados.</div>';
   } catch (error) {
     status.textContent = error.message;
     results.innerHTML = '<div class="empty">La consulta no ha podido completarse.</div>';
