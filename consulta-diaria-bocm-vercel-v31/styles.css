@@ -75,3 +75,25 @@ header { position: relative; }
 
 /* v25: ficha reducida al CVE y al título oficial del XML. */
 .announcement-title { margin-bottom: 18px; }
+
+
+.email-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 10px 0 18px;
+  padding: 16px 18px;
+  background: #fff;
+  border: 1px solid #dfe4ed;
+  border-radius: 15px;
+}
+.email-actions[hidden] { display: none; }
+.email-actions span { color: #667287; font-size: .9rem; }
+.secondary-button {
+  flex: 0 0 auto;
+  background: #172033;
+}
+@media (max-width: 560px) {
+  .email-actions { align-items: stretch; flex-direction: column; }
+  .secondary-button { width: 100%; }
+}
