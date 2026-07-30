@@ -7,6 +7,10 @@ const municipalityList = $('#municipality-list');
 const searchButton = $('#search');
 const status = $('#status');
 const results = $('#results');
+const emailActions = $('#email-actions');
+const prepareEmailButton = $('#prepare-email');
+
+let currentEmailResults = [];
 
 const BATCH_SIZE = 4;
 const MAX_RETRY_ROUNDS = 3;
@@ -36,8 +40,40 @@ function renderCard(item) {
 }
 
 function setLoading(text) {
+  currentEmailResults = [];
+  emailActions.hidden = true;
   results.innerHTML = '';
   status.innerHTML = `<span class="spinner"></span>${text}`;
+}
+
+function formatDateForEmail(value) {
+  const [year, month, day] = String(value).split('-');
+  return day && month && year ? `${day}/${month}/${year}` : value;
+}
+
+function buildEmailBody(items) {
+  const formattedDate = formatDateForEmail(dateInput.value);
+  const publications = items
+    .map(item => `· ______________________________\n  ${item.url}`)
+    .join('\n\n');
+
+  return `Buenos días Jorge\n\nAdjunto las publicaciones del ${formattedDate}:\n\n${publications}\n\nSaludos`;
+}
+
+async function prepareEmail() {
+  if (!currentEmailResults.length) return;
+
+  const formattedDate = formatDateForEmail(dateInput.value);
+  const subject = `Publicaciones BOCM ${formattedDate}`;
+  const body = buildEmailBody(currentEmailResults);
+
+  try {
+    await navigator.clipboard.writeText(body);
+  } catch {
+    // El correo se abre igualmente aunque el navegador bloquee el portapapeles.
+  }
+
+  window.location.href = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
 }
 
 async function requestJson(params) {
@@ -121,6 +157,8 @@ async function runSearch() {
     const warning = incomplete ? ' · Consulta parcial: algún XML individual no respondió' : '';
     status.innerHTML = `<strong>BOCM nº ${manifest.bulletinNumber || '?'}</strong> · ${finalResults.length} resultado(s) de interés entre ${scanned} anuncios revisados de ${allCves.length} publicados${warning}. <a href="${manifest.bulletinUrl}" target="_blank" rel="noopener">Ver sumario oficial</a>`;
     results.innerHTML = finalResults.length ? finalResults.map(renderCard).join('') : '<div class="empty">No se han detectado publicaciones que cumplan los criterios configurados.</div>';
+    currentEmailResults = finalResults;
+    emailActions.hidden = finalResults.length === 0;
   } catch (error) {
     status.textContent = error.message;
     results.innerHTML = '<div class="empty">La consulta no ha podido completarse.</div>';
@@ -131,3 +169,5 @@ async function runSearch() {
 
 searchButton.addEventListener('click', runSearch);
 municipalityInput.addEventListener('keydown', event => { if (event.key === 'Enter') runSearch(); });
+
+prepareEmailButton.addEventListener('click', prepareEmail);
